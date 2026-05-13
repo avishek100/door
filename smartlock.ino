@@ -54,8 +54,8 @@
  *
  *  Relay Module            ESP32
  *  ------------------      -----
- *  IN                  →   GPIO 2
- *  VCC                 →   5V  ← MUST be 5V, not 3.3V
+ *  IN                  →   GPIO 16
+ *  VCC                 →   3.3V or 5V  ← Works with 3.3V-5V depending on relay board
  *  GND                 →   GND ← shared GND with ESP32
  *
  *  Solenoid Lock           Relay & Power
@@ -66,7 +66,7 @@
  *  12V PSU GND         →   Solenoid - (Black) AND ESP32 GND (common ground)
  *
  *  ⚠️  WIRING CHECKLIST — if solenoid doesn't fire:
- *  1. Relay VCC must be 5V (not 3.3V) — many relay boards need 5V to energize
+ *  1. Relay VCC can be 3.3V or 5V — depends on your relay board (works with 3.8V here)
  *  2. Solenoid - (black) wire must go to 12V PSU GND
  *  3. 12V PSU GND and ESP32 GND must share a common ground
  *  4. Confirm you are using the NO terminal (not NC) on the relay
@@ -116,7 +116,7 @@ const char *WIFI_PASSWORD = "DHInternet@20992086";
 #define BUZZER_MS 40
 
 // Relay
-#define RELAY_PIN 2
+#define RELAY_PIN 16
 
 // Exit button — physical touch button to open the door from outside
 // Use a GPIO that supports INPUT_PULLUP; GPIO 34 cannot use internal pull-ups.
@@ -130,11 +130,6 @@ const char *WIFI_PASSWORD = "DHInternet@20992086";
 #define LEDC_FREQ 5000           // PWM frequency 5kHz
 #define LEDC_RESOLUTION 8        // 8-bit resolution (0-255)
 #define BACKLIGHT_BRIGHTNESS 255 // Max brightness when on
-
-// Wake button — wakes screen only, doesn't trigger other actions
-// REMOVED: Wake button feature removed per user request - using touch-only wake
-// #define WAKE_BUTTON_PIN 34 // Outside wake button (GPIO 34, no internal pull-up available)
-// #define WAKE_BUTTON_STABLE_MS 30
 
 // Outside unlock button (second touch button) — GPIO for future use
 #define OUTSIDE_TOUCH_PIN 35 // GPIO 35 for outside touch unlock button (optional)
@@ -160,8 +155,6 @@ const char *WIFI_PASSWORD = "DHInternet@20992086";
 #define RFID_SCAN_TIMEOUT 100
 #define DISPLAY_UPDATE_RATE 20 // ms between display updates // RFID polling timeout
 #define SCREENSAVER_MS 15000   // Inactivity before screen saver (15 seconds)
-// REMOVED: Wake button debounce define removed
-// #define WAKE_DEBOUNCE_LOG_MS 2000 // Debounce wake button to prevent rapid re-wakes
 // ── Touch Calibration Values ──────────────────────────────
 // PORTRAIT MODE - Calibrated with corner touches
 // Top-left raw: x=3734, y=3915 → screen (0, 0)
@@ -247,6 +240,7 @@ enum Screen
   SCR_IDLE,
   SCR_GRANTED,
   SCR_DENIED,
+  SCR_BLOCKED,
   SCR_ADMIN_PIN,
   SCR_ADMIN_MENU,
   SCR_VIEW_LOG,
@@ -312,14 +306,9 @@ unsigned long lastExitButtonLog = 0;     // Prevent duplicate exit button logs
 
 // bool exitButtonReady = false; // Removed, simplified logic
 
-// ── Backlight state (wake button variables removed) ───────────────────────────
-// REMOVED: Wake button state variables removed per user request - using touch-only wake
-// int wakeButtonLastRawState = HIGH;
-// int wakeButtonLastStableState = HIGH;
-// unsigned long wakeButtonDebounceTime = 0;
-// unsigned long lastWakeButtonLog = 0; // Prevent rapid re-wakes
 bool firstTouchAfterWake = false; // Flag: consume first touch after waking
-bool backlightForced = false;     // Force backlight on during OTA
+bool backlightForced = false;     // Force backlight on during update
+String lastBlockedName = "";
 
 // =================================================================
 //  RELAY CONTROL — centralised so every unlock goes through here
@@ -430,7 +419,7 @@ void backlightSet(uint8_t brightness, const char *reason = "pwm control")
 }
 
 // ── setBacklightForced ──────────────────────────────────────────
-// Force backlight on (for OTA updates), cannot be turned off
+// Force backlight on (for updates), cannot be turned off
 void setBacklightForced(bool forced)
 {
   backlightForced = forced;
@@ -438,7 +427,7 @@ void setBacklightForced(bool forced)
   {
     ledcWrite(TFT_LED_PIN, BACKLIGHT_BRIGHTNESS);
     screenSleeping = false;
-    Serial.println("[BACKLIGHT] FORCED ON (OTA or maintenance)");
+    Serial.println("[BACKLIGHT] FORCED ON (update or maintenance)");
   }
   else
   {
@@ -787,6 +776,9 @@ void drawCurrentScreen()
   case SCR_DENIED:
     drawDenied(lastDeniedUID);
     break;
+  case SCR_BLOCKED:
+    drawBlocked(lastBlockedName);
+    break;
   case SCR_ADMIN_PIN:
     drawAdminPin();
     break;
@@ -825,22 +817,12 @@ void drawCurrentScreen()
 void drawHeader(const char *title, uint16_t color)
 {
   // Keep every header the same blue color (C_HEADER) regardless of caller-supplied color.
-  tft.fillRect(0, 0, SCREEN_W, 36, C_HEADER);
+  tft.fillRect(0, 0, SCREEN_W, 24, C_HEADER);
 
   int tlen = strlen(title);
-  int titleWidth = tlen * 12;
-  if (titleWidth <= SCREEN_W - 8)
-  {
-    tft.setTextSize(2);
-    tft.setTextColor(C_WHITE);
-    tft.setCursor(max(4, (SCREEN_W - titleWidth) / 2), 10);
-  }
-  else
-  {
-    tft.setTextSize(1);
-    tft.setTextColor(C_WHITE);
-    tft.setCursor(max(4, (SCREEN_W - tlen * 6) / 2), 14);
-  }
+  tft.setTextSize(2);
+  tft.setTextColor(C_WHITE);
+  tft.setCursor(max(4, (SCREEN_W - tlen * 12) / 2), 4);
   tft.print(title);
 }
 
@@ -880,11 +862,11 @@ void drawAdminPinDots()
   int centerX = SCREEN_W / 2;
   int dotSpan = 90;
   int dotStartX = centerX - dotSpan / 2;
-  tft.fillRect(dotStartX - 10, 78, dotSpan + 20, 24, C_BG);
+  tft.fillRect(dotStartX - 10, 58, dotSpan + 20, 24, C_BG);
   for (int i = 0; i < 4; i++)
   {
     int dotX = dotStartX + i * 30;
-    int dotY = 90;
+    int dotY = 70;
     if (i < (int)adminPinEntry.length())
       tft.fillCircle(dotX, dotY, 7, C_GREEN);
     else
@@ -963,47 +945,43 @@ void drawIdle()
   tft.fillScreen(C_BG);
 
   // ── Header ─────────────────────────────────────────────────
-  tft.fillRect(0, 0, SCREEN_W, 42, 0x0210);
+  tft.fillRect(0, 0, SCREEN_W, 24, C_HEADER);
 
   // Signal bars — top left
   int heights[] = {5, 9, 13, 18};
   for (int i = 0; i < 4; i++)
   {
     int h = heights[i];
-    tft.fillRect(6 + i * 7, 30 - h, 4, h, 0x07E4);
+    tft.fillRect(6 + i * 7, 20 - h, 4, h, 0x07E4);
   }
 
-  // Title — two lines, centred
+  // Title — centred
   tft.setTextColor(C_WHITE);
   tft.setTextSize(2);
-  String l1 = "SMART DOOR";
-  tft.setCursor((SCREEN_W - l1.length() * 12) / 2, 5);
+  String l1 = "RND LOCK";
+  tft.setCursor((SCREEN_W - l1.length() * 12) / 2, 2);
   tft.print(l1);
-  tft.setTextSize(1);
-  String l2 = "LOCK";
-  tft.setCursor((SCREEN_W - l2.length() * 6) / 2, 27);
-  tft.print(l2);
 
   // ── Status bar — WiFi + IP on same line ────────────────────
-  tft.fillRect(0, 42, SCREEN_W, 18, 0x0008);
+  tft.fillRect(0, 26, SCREEN_W, 18, 0x0008);
   tft.setTextSize(1);
   if (WiFi.status() == WL_CONNECTED)
   {
     tft.setTextColor(0x07E4); // green
-    tft.setCursor(4, 47);
+    tft.setCursor(4, 31);
     tft.print("WiFi Connected");
     tft.setTextColor(0x4A5F); // steel blue
     String ip = WiFi.localIP().toString();
-    tft.setCursor(SCREEN_W - ip.length() * 6 - 4, 47);
+    tft.setCursor(SCREEN_W - ip.length() * 6 - 4, 31);
     tft.print(ip);
   }
   else
   {
     tft.setTextColor(C_ORANGE);
-    tft.setCursor(4, 47);
+    tft.setCursor(4, 31);
     tft.print("Not Connected");
     tft.setTextColor(0x4A5F);
-    tft.setCursor(SCREEN_W - 12 * 6 - 4, 47);
+    tft.setCursor(SCREEN_W - 12 * 6 - 4, 31);
     tft.print("0.0.0.0");
   }
 
@@ -1156,7 +1134,7 @@ void drawAdminPin()
   tft.setTextColor(C_WHITE);
   tft.setTextSize(1);
   int promptWidth = strlen("Enter your 4-digit PIN") * 6;
-  tft.setCursor((SCREEN_W - promptWidth) / 2, 46);
+  tft.setCursor((SCREEN_W - promptWidth) / 2, 45);
   tft.print("Enter your 4-digit PIN");
 
   drawAdminPinDots();
@@ -1173,9 +1151,9 @@ void drawAdminPin()
   for (int i = 0; i < 12; i++)
   {
     int col = i % 3, row = i / 3;
-    int bx = 8 + col * 76;
-    int by = 108 + row * 40;
-    drawButton(bx, by, 68, 36, keys[i], kcolors[i], C_WHITE);
+    int bx = 4 + col * 82;
+    int by = 90 + row * 46;
+    drawButton(bx, by, 80, 44, keys[i], kcolors[i], C_WHITE);
   }
   drawNavBar();
 }
@@ -1567,10 +1545,10 @@ void handleTouch(int tx, int ty)
   case SCR_ADMIN_PIN:
   {
     // Numpad grid: 3 cols × 4 rows (matches drawAdminPin layout)
-    if (tx >= 8 && tx <= 228 && ty >= 108 && ty < 268)
+    if (tx >= 4 && tx <= 248 && ty >= 90 && ty < 280)
     {
-      int col = (tx - 8) / 76;   // horiz step used in draw
-      int row = (ty - 108) / 40; // vertical step used in draw
+      int col = (tx - 4) / 82;  // horiz step used in draw
+      int row = (ty - 90) / 46; // vertical step used in draw
       int key = row * 3 + col;
       const char *keys[] = {"1", "2", "3",
                             "4", "5", "6",
@@ -1974,6 +1952,7 @@ tr:hover td{background:#1c2128}
 <button class="btn log-btn on" onclick="filt('all',this)">All</button>
 <button class="btn log-btn" onclick="filt('granted',this)">Granted</button>
 <button class="btn log-btn" onclick="filt('denied',this)">Denied</button>
+<button class="btn" onclick="clearLogs()">Clear Logs</button>
 <input class="src small" id="openPassword" type="password" placeholder="Web password" style="width:160px">
 <button class="btn" onclick="openDoor()">Open Lock</button>
 <input class="src" id="q" placeholder="Search name..." style="margin-left:auto;width:180px" oninput="render()">
@@ -2150,6 +2129,31 @@ async function openDoor(){
     document.getElementById('doorStatus').textContent = data.message || (data.success ? 'Door opened' : 'Open failed');
     if (!data.success) document.getElementById('doorStatus').style.color = 'var(--red)';
     else document.getElementById('doorStatus').style.color = 'var(--green)';
+    if (data.success) loadLogs();
+    setTimeout(()=>{
+      document.getElementById('doorStatus').textContent='Door ready';
+      document.getElementById('doorStatus').style.color='var(--text)';
+    }, 3000);
+  }catch(e){
+    document.getElementById('doorStatus').textContent = 'Connection failed';
+    document.getElementById('doorStatus').style.color='var(--red)';
+  }
+}
+async function clearLogs(){
+  if (!confirm('Clear all access logs?')) return;
+  document.getElementById('doorStatus').textContent = 'Clearing logs...';
+  try{
+    const r=await fetch('/api/clearlogs', {method:'POST'});
+    const data=await r.json();
+    document.getElementById('doorStatus').textContent = data.message || (data.success ? 'Logs cleared' : 'Clear failed');
+    document.getElementById('doorStatus').style.color = data.success ? 'var(--green)' : 'var(--red)';
+    if (data.success) {
+      all=[];
+      render();
+      document.getElementById('s1').textContent='0';
+      document.getElementById('s2').textContent='0';
+      document.getElementById('s3').textContent='0';
+    }
     setTimeout(()=>{
       document.getElementById('doorStatus').textContent='Door ready';
       document.getElementById('doorStatus').style.color='var(--text)';
@@ -2189,6 +2193,16 @@ void handleLogJSON()
   json += "]";
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send(200, "application/json", json);
+}
+
+void handleClearLogs()
+{
+  logCount = 0;
+  logHead = 0;
+  saveLogToSPIFFS();
+  Serial.println("[WEB] Log history cleared via web app");
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", "{\"success\":true,\"message\":\"Logs cleared\"}");
 }
 
 String escapeJsonString(const String &text)
@@ -2444,8 +2458,10 @@ void handleOpenDoor()
 {
   String body = server.arg("plain");
   String password = jsonValue(body, "password");
+  Serial.println("[WEB] Open door requested");
   if (password.length() == 0 || password != WEB_PASSWORD)
   {
+    Serial.println("[WEB] Invalid password for web door open");
     server.sendHeader("Access-Control-Allow-Origin", "*");
     server.send(401, "application/json", "{\"success\":false,\"message\":\"Invalid password\"}");
     return;
@@ -2507,7 +2523,7 @@ void setup()
   tft.setTextColor(C_CYAN);
   tft.setTextSize(2);
   tft.setCursor(20, 90);
-  tft.print("Smart Door Lock");
+  tft.print("System is");
   tft.setTextSize(1);
   tft.setTextColor(C_GRAY);
   tft.setCursor(20, 116);
@@ -2529,11 +2545,6 @@ void setup()
   // Configure LEDC for PWM control of backlight (using new ESP32 Arduino core 3.0+ API)
   ledcAttach(TFT_LED_PIN, LEDC_FREQ, LEDC_RESOLUTION);
   backlightOn("startup"); // Start with backlight ON
-
-  // Wake button — REMOVED: Wake button feature removed per user request
-  // Using touch-only wake mechanism instead
-  // REMOVED: Wake button pinMode removed
-  // pinMode(WAKE_BUTTON_PIN, INPUT); // GPIO 34 — must use external pull-up/pull-down
 
   // Optional: Outside unlock button (second touch button)
   // pinMode(OUTSIDE_TOUCH_PIN, INPUT_PULLUP);  // Uncomment when wiring is complete
@@ -2613,6 +2624,7 @@ void setup()
   // Web server routes
   server.on("/", handleRoot);
   server.on("/api/log", handleLogJSON);
+  server.on("/api/clearlogs", HTTP_POST, handleClearLogs);
   server.on("/api/cards", HTTP_GET, handleCardsJSON);
   server.on("/api/cards", HTTP_POST, handleCardModify);
   server.on("/api/open", HTTP_POST, handleOpenDoor);
@@ -2645,7 +2657,7 @@ void setup()
     } });
   server.begin();
 
-  // OTA Update setup
+  // Update setup
   ArduinoOTA.setHostname("Door");
   ArduinoOTA.setPassword("admin"); // Optional password for security
   ArduinoOTA.onStart([]()
@@ -2657,12 +2669,12 @@ void setup()
       type = "filesystem";
     }
     Serial.println("Start updating " + type);
-    setBacklightForced(true);  // Force backlight on for OTA progress visibility
+    setBacklightForced(true);  // Force backlight on for update progress visibility
     tft.fillScreen(C_BG);
     tft.setTextColor(C_YELLOW);
     tft.setTextSize(2);
     tft.setCursor(20, 100);
-    tft.print("OTA Update Starting..."); });
+    tft.print("Update Starting..."); });
   ArduinoOTA.onEnd([]()
                    {
     Serial.println("\nEnd");
@@ -2671,7 +2683,7 @@ void setup()
     tft.setTextColor(C_GREEN);
     tft.setTextSize(2);
     tft.setCursor(20, 100);
-    tft.print("OTA Update Complete!");
+    tft.print("Update Complete!");
     delay(2000);
     drawIdle(); });
   ArduinoOTA.onProgress([](unsigned int progress, unsigned int total)
@@ -2752,45 +2764,18 @@ void loop()
     }
   }
 
-  // ── Wake button — REMOVED: Wake button feature removed per user request ────────
-  // Using touch-only wake mechanism instead
-  // REMOVED: Wake button debounce logic removed
-  /*
-  int rawWakeState = digitalRead(WAKE_BUTTON_PIN);
-  if (rawWakeState != wakeButtonLastRawState)
-  {
-    wakeButtonDebounceTime = millis();
-    wakeButtonLastRawState = rawWakeState;
-  }
-  if (millis() - wakeButtonDebounceTime > WAKE_BUTTON_STABLE_MS)
-  {
-    if (wakeButtonLastStableState == HIGH && rawWakeState == LOW)
-    {
-      // Wake button pressed
-      wakeButtonLastStableState = LOW;
-      unsigned long now = millis();
-      if (screenSleeping && (now - lastWakeButtonLog) >= WAKE_DEBOUNCE_LOG_MS)
-      {
-        beepBuzzer(1800, 60); // Gentle beep for wake
-        backlightOn("wake button pressed");
-        drawCurrentScreen();        // Redraw current screen
-        firstTouchAfterWake = true; // Mark: consume first touch
-        lastWakeButtonLog = now;
-        lastActivity = millis(); // Reset inactivity timer
-        Serial.println("[WAKE] Screen awakened by button (first touch will be ignored)");
-      }
-    }
-    else if (wakeButtonLastStableState == LOW && rawWakeState == HIGH)
-    {
-      wakeButtonLastStableState = HIGH;
-    }
-  }
-  */
-
   // ── Auto relock after RFID unlock period ─────────────────────
   if (doorUnlocked && millis() >= unlockUntil)
   {
     lockDoor("RFID unlock timeout");
+    if (digitalRead(RELAY_PIN) != LOCK_CLOSE)
+    {
+      Serial.println("[AUTOLOCK] Relay state mismatch after first lock attempt, retrying...");
+      digitalWrite(RELAY_PIN, LOCK_CLOSE);
+      delay(50);
+      int retryState = digitalRead(RELAY_PIN);
+      Serial.printf("[AUTOLOCK] Retry GPIO%d = %s\n", RELAY_PIN, retryState == LOW ? "LOW" : "HIGH");
+    }
     doorUnlocked = false;
     lastScannedUID = "";
     lastCardLeftRange = 0;
@@ -2813,8 +2798,9 @@ void loop()
     {
       drawAdminMenu(); // Redraw menu
     }
-    else if (currentScreen == SCR_IDLE)
+    else if (currentScreen == SCR_IDLE || currentScreen == SCR_GRANTED || currentScreen == SCR_DENIED || currentScreen == SCR_BLOCKED)
     {
+      currentScreen = SCR_IDLE;
       drawIdle();
     }
   }
@@ -2977,6 +2963,7 @@ void loop()
   }
 
   // ── Normal RFID scan (only from idle screen) ─────────────────
+  static unsigned long rfidFailureCount = 0;
   if ((currentScreen == SCR_IDLE || screenSleeping) && !doorUnlocked)
   {
     unsigned long now2 = millis();
@@ -2985,6 +2972,7 @@ void loop()
       lastRFIDScan = now2;
       if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial())
       {
+        rfidFailureCount = 0; // Reset on success
         String uid = getUID();
         rfid.PICC_HaltA();
         rfid.PCD_StopCrypto1();
@@ -3011,6 +2999,8 @@ void loop()
         if (idx >= 0 && cards[idx].blocked)
         {
           // BLOCKED
+          currentScreen = SCR_BLOCKED;
+          lastBlockedName = cards[idx].name;
           beepFailure();
           addLog(uid, cards[idx].name, cards[idx].role, false);
           drawBlocked(cards[idx].name);
@@ -3021,6 +3011,9 @@ void loop()
         else if (idx >= 0)
         {
           // GRANTED
+          currentScreen = SCR_GRANTED;
+          lastGrantedName = cards[idx].name;
+          lastGrantedRole = cards[idx].role;
           beepSuccess();
           addLog(uid, cards[idx].name, cards[idx].role, true);
           drawGranted(cards[idx].name, cards[idx].role);
@@ -3034,6 +3027,8 @@ void loop()
         else
         {
           // DENIED — unknown card
+          currentScreen = SCR_DENIED;
+          lastDeniedUID = uid;
           beepFailure();
           addLog(uid, "Unknown", "N/A", false);
           drawDenied(uid);
@@ -3050,6 +3045,17 @@ void loop()
           lastCardLeftRange = now2;
           lastScannedUID = ""; // Clear last scanned UID
           Serial.println("[RFID] Card left reader range");
+        }
+        else
+        {
+          // Increment failure count if no card and no previous card
+          rfidFailureCount++;
+          if (rfidFailureCount > 10) // After 10 consecutive failures, reset
+          {
+            Serial.println("[RFID] Reader unresponsive, resetting PCD...");
+            rfid.PCD_Init();
+            rfidFailureCount = 0;
+          }
         }
       }
     }
